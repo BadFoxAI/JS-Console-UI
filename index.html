@@ -1,0 +1,1276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Browser-Based Mock Terminal & File System</title>
+</head>
+<body>
+    <!-- Main container for the application layout -->
+    <div id="app-container"></div>
+
+    <!-- Placeholder for the main content area (HTML pages, editor, etc.) -->
+    <div id="main-content-holder" style="display:none;"></div>
+
+    <!-- Placeholder for the terminal interface -->
+    <div id="terminal-holder" style="display:none;"></div>
+
+    <script>
+        // --- DOM Element References ---
+        const appContainer = document.getElementById('app-container');
+        const mainContentHolder = document.getElementById('main-content-holder');
+        const terminalHolder = document.getElementById('terminal-holder');
+
+        // --- Terminal State ---
+        let isTerminalActive = false;
+        let terminalUi = { output: null, input: null }; // References to terminal DOM elements
+        const promptCharDefault = '$ ';
+        let currentPrompt = promptCharDefault;
+        let commandHistory = [];
+        let historyIndex = -1; // For navigating command history
+        let terminalOutputLog = [];
+        const MAX_LOG_LINES = 200; // Max lines to keep in terminal log
+
+        // --- Background Color Management ---
+        const bgColorPresets = {
+            default: { page: "white", term: "#DDDDDD" }, // Default terminal bg is light gray
+            dark: { page: "black", term: "black" },
+            light: { page: "#F0F0F0", term: "#E8E8E8" }
+        };
+        let currentBgColors = JSON.parse(JSON.stringify(bgColorPresets.default));
+
+        /**
+         * Applies the current background colors to the page body and terminal.
+         * Also triggers a layout refresh.
+         */
+        function applyBackgroundColors() {
+            document.body.bgColor = currentBgColors.page;
+            if (isTerminalActive && terminalHolder) {
+                applyTerminalElementColors(); // Update active terminal's colors
+            }
+            applyLayout();
+        }
+
+        // --- Mock File System ---
+        const MOCK_FS_STORAGE_KEY = 'mockFileSystem_v2.3'; // Unique key for localStorage
+        let mockFS = {}; // The file system object
+        let currentWorkingDirectoryPath = '/'; // Current active directory
+
+        /**
+         * Returns the default structure for the mock file system.
+         * @returns {object} The default file system object.
+         */
+        function getDefaultFileSystemStructure() {
+             return {
+                '/': { // Root directory
+                    type: 'dir',
+                    children: {
+                        'home': {
+                            type: 'dir',
+                            children: {
+                                'user': {
+                                    type: 'dir',
+                                    children: {
+                                        'documents': { type: 'dir', children: {} },
+                                        'welcome.txt': { type: 'file', content: 'Welcome to your mock file system!\nType `help` for a list of commands.' },
+                                        'notes.txt': {type: 'file', content: 'This is an editable notes file.\nTry `edit /home/user/notes.txt` to modify it.'}
+                                    }
+                                }
+                            }
+                        },
+                        'apps': {
+                            type: 'dir',
+                            children: {
+                                'example.js': {type: 'file', content: 'logAndDisplay("Hello from example.js running in the mock FS!");'},
+                                'page1.html': {type: 'file', content: '<h2>Page 1 Loaded</h2><p>This is content from page1.html in the mock FS.</p>'}
+                            }
+                        },
+                        'README.txt': { type: 'file', content: 'Mock File System (v2.3)\n\nUse the `help` command in the terminal for detailed instructions and available operations.' }
+                    }
+                }
+            };
+        }
+
+        /**
+         * Saves the current state of the mock file system to localStorage.
+         */
+        function saveFSToLocalStorage() {
+            try {
+                localStorage.setItem(MOCK_FS_STORAGE_KEY, JSON.stringify(mockFS));
+            } catch (e) {
+                console.error("Error saving file system to localStorage:", e);
+                logAndDisplay("Error: Could not save file system. Storage might be full or unavailable.");
+            }
+        }
+
+        /**
+         * Loads the mock file system from localStorage, or initializes it with defaults if not found or invalid.
+         */
+        function loadFSFromLocalStorage() {
+            const fsString = localStorage.getItem(MOCK_FS_STORAGE_KEY);
+            if (fsString) {
+                try {
+                    mockFS = JSON.parse(fsString);
+                    // Basic validation: ensure root exists and is a directory
+                    if (!mockFS['/'] || mockFS['/'].type !== 'dir') {
+                        console.warn("Invalid file system found in localStorage, resetting to default.");
+                        mockFS = getDefaultFileSystemStructure();
+                    }
+                } catch (e) {
+                    console.error("Error parsing file system from localStorage, resetting to default:", e);
+                    mockFS = getDefaultFileSystemStructure();
+                }
+            } else {
+                mockFS = getDefaultFileSystemStructure();
+            }
+            // Ensure current path is valid after loading, default to root if not
+            if (!getNodeAtPath(currentWorkingDirectoryPath, '/')) { // Always check from root
+                currentWorkingDirectoryPath = '/';
+            }
+            updatePrompt();
+        }
+
+        /**
+         * Updates the terminal prompt string to reflect the current working directory.
+         */
+        function updatePrompt() {
+            let displayPath = currentWorkingDirectoryPath;
+            if (displayPath.length > 1 && displayPath.endsWith('/')) {
+                displayPath = displayPath.slice(0, -1); // Avoid double slash for non-root
+            }
+            currentPrompt = displayPath + promptCharDefault;
+        }
+
+        /**
+         * Resolves a relative or absolute path to an absolute path.
+         * @param {string} currentAbsolutePath - The base absolute path.
+         * @param {string} relativeOrAbsolutePath - The path to resolve.
+         * @returns {string} The resolved absolute path.
+         */
+        function resolvePath(currentAbsolutePath, relativeOrAbsolutePath) {
+            let pathStack;
+            if (relativeOrAbsolutePath.startsWith('/')) { // Absolute path given
+                pathStack = [];
+            } else { // Relative path
+                pathStack = (currentAbsolutePath === '/' ? [] : currentAbsolutePath.substring(1).split('/').filter(p => p));
+            }
+
+            const segments = relativeOrAbsolutePath.split('/');
+            for (const segment of segments) {
+                if (segment === '' || segment === '.') { // Skip empty or current dir segments
+                    continue;
+                }
+                if (segment === '..') { // Go up one level
+                    if (pathStack.length > 0) {
+                        pathStack.pop();
+                    }
+                } else { // Go down one level
+                    pathStack.push(segment);
+                }
+            }
+            let resolved = '/' + pathStack.join('/');
+            return resolved === '/' && pathStack.length > 0 ? resolved + '/' : resolved; // Preserve trailing slash for directories if appropriate. For simplicity, always clean for now.
+        }
+
+
+        /**
+         * Retrieves a node (file or directory) from the mock file system at a given path.
+         * @param {string} path - The path to the node (can be relative or absolute).
+         * @param {string} [baseContextPath=currentWorkingDirectoryPath] - The base path for resolving relative paths.
+         * @returns {object|null} The file system node, or null if not found.
+         */
+        function getNodeAtPath(path, baseContextPath = currentWorkingDirectoryPath) {
+            if (!path) return null;
+            const absolutePath = resolvePath(baseContextPath, path);
+
+            const parts = absolutePath.split('/').filter(p => p !== ''); // Filter empty strings from split
+            let currentNode = mockFS['/']; // Always start from root for absolute resolution
+
+            if (absolutePath === '/') return currentNode;
+
+            for (let i = 0; i < parts.length; i++) {
+                const part = parts[i];
+                if (currentNode && currentNode.type === 'dir' && currentNode.children && currentNode.children[part]) {
+                    currentNode = currentNode.children[part];
+                } else {
+                    return null; // Path not found or part is not a directory
+                }
+            }
+            return currentNode;
+        }
+
+        /**
+         * Gets the parent node and the name of the item at the given path.
+         * @param {string} path - The path to the item.
+         * @param {string} [baseContextPath=currentWorkingDirectoryPath] - Base for resolving relative paths.
+         * @returns {{parentNode: object|null, name: string, parentPath: string|null}}
+         */
+        function getParentNodeAndName(path, baseContextPath = currentWorkingDirectoryPath) {
+            const absolutePath = resolvePath(baseContextPath, path);
+            if (absolutePath === '/') return { parentNode: null, name: '', parentPath: null }; // Root has no parent in this context
+
+            const lastSlash = absolutePath.lastIndexOf('/');
+            const parentPath = lastSlash === 0 ? '/' : absolutePath.substring(0, lastSlash);
+            const name = absolutePath.substring(lastSlash + 1);
+            const parentNode = getNodeAtPath(parentPath, '/'); // Parent is resolved from root
+
+            return { parentNode, name, parentPath };
+        }
+
+        /**
+         * Creates a deep copy of a file system node.
+         * @param {object} nodeToCopy - The node to copy.
+         * @returns {object} A deep copy of the node.
+         */
+        function deepCopyNode(nodeToCopy) {
+            // Simple deep copy using JSON stringify/parse, sufficient for FS objects
+            return JSON.parse(JSON.stringify(nodeToCopy));
+        }
+
+
+        // --- Main Application View Mode Management ---
+        let currentMainViewMode = 'main'; // 'main', 'file_explorer', 'edit'
+        const mainViewModesCycleOrder = ['main', 'file_explorer', 'edit'];
+        let mainViewContentCache = { // Cache for the default 'main' view content
+            main: `<h1>Welcome to the Mock Terminal Application!</h1>
+                   <p>This is the main content area. You can load HTML files from the mock file system here using the terminal's <code>loadhtml</code> command.</p>
+                   <p>Type <code>help</code> in the terminal for a list of commands.</p>
+                   <p>Use <strong>Alt+M</strong> to cycle through main application view modes (Main, File Explorer, Editor).</p>`
+        };
+        let editingFilePath = null; // Absolute path of the file currently being edited
+
+        /**
+         * Renders the content of the main application view based on `currentMainViewMode`.
+         */
+        function renderMainView() {
+            mainContentHolder.innerHTML = ''; // Clear previous content
+            switch (currentMainViewMode) {
+                case 'main':
+                    mainContentHolder.innerHTML = mainViewContentCache.main;
+                    break;
+                case 'file_explorer':
+                    mainContentHolder.innerHTML = '<h1>File Explorer Mode (Placeholder)</h1><p>This mode will eventually allow browsing the mock file system visually.</p>';
+                    break;
+                case 'edit':
+                    if (editingFilePath) {
+                        const node = getNodeAtPath(editingFilePath, '/'); // editingFilePath is absolute
+                        if (node && node.type === 'file') {
+                            const h1 = document.createElement('h1');
+                            h1.textContent = `Editing: ${editingFilePath}`;
+                            mainContentHolder.appendChild(h1);
+
+                            const textarea = document.createElement('textarea');
+                            textarea.id = 'file-editor-textarea';
+                            textarea.value = node.content || '';
+                            textarea.style.width = '98%';
+                            textarea.style.height = 'calc(100% - 100px)'; // Basic height adjustment
+                            textarea.style.minHeight = '200px';
+                            textarea.style.boxSizing = 'border-box'; // Consistent sizing
+                            textarea.setAttribute('aria-label', `Text editor for ${editingFilePath}`);
+                            mainContentHolder.appendChild(textarea);
+
+                            const saveButton = document.createElement('button');
+                            saveButton.textContent = 'Save (or use `saveedit` command)';
+                            saveButton.onclick = saveEditedFileViaButton;
+                            mainContentHolder.appendChild(saveButton);
+
+                            const closeButton = document.createElement('button');
+                            closeButton.textContent = 'Close Editor';
+                            closeButton.onclick = () => {
+                                editingFilePath = null;
+                                currentMainViewMode = 'main'; // Revert to main view
+                                renderMainView();
+                                logAndDisplay("Editor closed. Changes not saved unless `saveedit` or the save button was used.");
+                            };
+                            mainContentHolder.appendChild(closeButton);
+                        } else {
+                            mainContentHolder.innerHTML = `<h1>Error Loading File</h1><p>Could not load <code>${editingFilePath}</code> for editing. The file may have been moved or deleted.</p>`;
+                            logAndDisplay(`Error: File ${editingFilePath} not found for editing.`);
+                            editingFilePath = null;
+                            currentMainViewMode = 'main';
+                            setTimeout(renderMainView, 0); // Re-render main mode after error
+                        }
+                    } else {
+                        mainContentHolder.innerHTML = '<h1>Edit Mode</h1><p>No file selected for editing. Use the <code>edit <filepath></code> command in the terminal to open a file.</p>';
+                    }
+                    break;
+                default: // Fallback for unknown modes
+                    mainContentHolder.innerHTML = `<h1>Unknown Application Mode: ${currentMainViewMode}</h1>` + mainViewContentCache.main;
+            }
+        }
+
+        /**
+         * Saves the content from the text editor back to the mock file system.
+         * @returns {boolean} True if save was successful, false otherwise.
+         */
+        function saveEditedFile() {
+            if (currentMainViewMode === 'edit' && editingFilePath) {
+                const textarea = document.getElementById('file-editor-textarea');
+                if (textarea) {
+                    const newContent = textarea.value;
+                    // Get parent and name again in case path was manipulated externally (though unlikely here)
+                    const { parentNode, name } = getParentNodeAndName(editingFilePath, '/');
+
+                    if (parentNode && parentNode.children && parentNode.children[name] && parentNode.children[name].type === 'file') {
+                        parentNode.children[name].content = newContent;
+                        saveFSToLocalStorage();
+                        logAndDisplay(`File '${editingFilePath}' saved successfully.`);
+                        return true;
+                    } else {
+                        logAndDisplay(`Error saving '${editingFilePath}': File or its parent directory no longer exists, or target is not a file.`);
+                        return false;
+                    }
+                } else {
+                    logAndDisplay("Error: Editor textarea element not found. Cannot save.");
+                    return false;
+                }
+            } else {
+                logAndDisplay("Not in edit mode or no file is currently being edited. Use `edit <filepath>` first.");
+                return false;
+            }
+        }
+        /** Saves the edited file when the 'Save' button in the editor UI is clicked. */
+        function saveEditedFileViaButton() {
+            saveEditedFile();
+        }
+
+        // --- Terminal Layout View Management ---
+        const VIEW_MAIN_FULL = 'main_full', VIEW_TERM_FULL = 'term_full', VIEW_SPLIT_TERM_LEFT = 'term_left',
+              VIEW_SPLIT_TERM_RIGHT = 'term_right', VIEW_SPLIT_TERM_TOP = 'term_top', VIEW_SPLIT_TERM_BOTTOM = 'term_bottom';
+        let currentLayoutMode = VIEW_MAIN_FULL; // Current display layout of terminal vs main content
+        let currentSplitPercentage = 30; // Default split percentage for terminal
+        const viewCycleConfig = [ // Defines the sequence of layouts for Ctrl+`
+            { layout: VIEW_SPLIT_TERM_BOTTOM, percentage: 30 }, { layout: VIEW_SPLIT_TERM_LEFT, percentage: 30 },
+            { layout: VIEW_SPLIT_TERM_RIGHT,  percentage: 30 }, { layout: VIEW_SPLIT_TERM_TOP, percentage: 30 },
+            { layout: VIEW_TERM_FULL,         percentage: 100}, { layout: VIEW_MAIN_FULL, percentage: 0 }
+        ];
+        let currentCycleIndex = -1; // Index for viewCycleConfig, -1 means terminal is initially inactive
+        let customSplitPercentages = {}; // Stores user-defined percentages for split views
+
+        /**
+         * Appends text to the visible terminal output area and ensures it scrolls to the bottom.
+         * @param {string} text - The text to append.
+         */
+        function appendToActualTerminalOutput(text) {
+            if (isTerminalActive && terminalUi.output) {
+                terminalUi.output.textContent += text + '\n';
+                terminalUi.output.scrollTop = terminalUi.output.scrollHeight; // Auto-scroll
+            }
+        }
+
+        /**
+         * Re-renders the entire terminal output from the log. Used when activating terminal.
+         */
+        function rerenderTerminalOutput() {
+            if (!isTerminalActive || !terminalUi.output) return;
+            terminalUi.output.textContent = ''; // Clear current display
+            terminalOutputLog.forEach(line => { // Add each logged line
+                terminalUi.output.textContent += line + '\n';
+            });
+            if (terminalUi.output) terminalUi.output.scrollTop = terminalUi.output.scrollHeight;
+        }
+
+        /**
+         * Logs text to the internal terminal log and displays it on the terminal.
+         * @param {string} text - The text to log and display.
+         * @param {boolean} [isCommandEcho=false] - If true, prepends the current prompt to the text.
+         */
+        function logAndDisplay(text, isCommandEcho = false) {
+            let lineToLogAndDisplay = String(text);
+            if (isCommandEcho) {
+                lineToLogAndDisplay = currentPrompt + lineToLogAndDisplay;
+            }
+            terminalOutputLog.push(lineToLogAndDisplay);
+            if (terminalOutputLog.length > MAX_LOG_LINES) { // Trim log if too long
+                terminalOutputLog.shift();
+            }
+            if (isTerminalActive && terminalUi.output) { // Display if terminal is active
+                appendToActualTerminalOutput(lineToLogAndDisplay);
+            }
+        }
+
+        /**
+         * Displays a formatted help message in the terminal.
+         */
+        function displayHelp() {
+            logAndDisplay("--- Ultra-Barebones Terminal Help ---");
+
+            logAndDisplay("\nFile System Commands:");
+            logAndDisplay("  ls [path]            - List directory contents");
+            logAndDisplay("  cd <path>            - Change directory");
+            logAndDisplay("  pwd                  - Print working directory");
+            logAndDisplay("  cat <filepath>       - Display file content");
+            logAndDisplay("  mkdir <dirname>      - Create directory");
+            logAndDisplay("  touch <filename>     - Create empty file or update timestamp");
+            logAndDisplay("  echo \"text\" > file   - Write text to file (overwrite)");
+            logAndDisplay("  echo \"text\" >> file  - Append text to file");
+            logAndDisplay("  rm <path> [-r]       - Remove file or directory (-r for recursive)");
+            logAndDisplay("  cp <source> <dest>   - Copy file or directory");
+            logAndDisplay("  mv <source> <dest>   - Move/rename file or directory");
+
+            logAndDisplay("\nExecution/View Commands:");
+            logAndDisplay("  run <filepath.js>    - Execute JS file (uses eval - use with trusted code)");
+            logAndDisplay("  loadhtml <file.html> - Load HTML into main view (main mode - use with trusted code)");
+            logAndDisplay("  edit <filepath>      - Open file in main view text editor");
+            logAndDisplay("  saveedit             - Save content from text editor to file");
+            logAndDisplay("  viewmode [mode]      - Switch main view (main, file_explorer, edit). Alt+M to cycle.");
+
+
+            logAndDisplay("\nTerminal/Layout Commands:");
+            logAndDisplay("  size [ + | - | +/-N[%] | default ]");
+            logAndDisplay("                       - Adjusts split view terminal size.");
+            logAndDisplay("                         '+'/'_': +/- 5%. 'default': reset current split view.");
+            logAndDisplay("  bgcolor page <color> - Set page background color");
+            logAndDisplay("  bgcolor term <color> - Set terminal background color");
+            logAndDisplay("  bgcolor preset <name>- Load color preset (default, dark, light)");
+            logAndDisplay("  bgcolor reset        - Reset colors to default preset");
+            logAndDisplay("  clear                - Clear terminal output");
+            logAndDisplay("  echo <text>          - Display text in terminal (if no redirection)");
+            logAndDisplay("  date                 - Display current date and time");
+            logAndDisplay("  about                - Display application information");
+            logAndDisplay("  exit                 - Deactivate terminal");
+            logAndDisplay("  help                 - Display this help message");
+
+            logAndDisplay("\nKeybindings:");
+            logAndDisplay("  Ctrl+\` (` or ~)    : Toggle Terminal & Cycle Layouts");
+            logAndDisplay("  Alt+M                : Cycle Main App View Modes");
+            logAndDisplay("  Esc                  : Deactivate Terminal (if not in editor mode).");
+            logAndDisplay("  Arrow Up/Down        : Navigate command history in terminal input.");
+        }
+
+        /**
+         * Processes a command entered into the terminal.
+         * @param {string} command - The command string.
+         */
+        function processCommand(command) {
+            const parts = command.trim().split(' ');
+            const cmd = parts[0].toLowerCase();
+            const args = parts.slice(1);
+            let targetPath, node, content; // Common variables for command processing
+
+            switch (cmd) {
+                case 'help':
+                    displayHelp();
+                    break;
+                case 'ls':
+                    targetPath = args.length > 0 ? args.join(' ') : '.';
+                    node = getNodeAtPath(targetPath);
+                    if (node && node.type === 'dir') {
+                        const entries = Object.keys(node.children || {}).sort();
+                        if (entries.length === 0) {
+                            logAndDisplay("(empty directory)");
+                        } else {
+                            entries.forEach(entry => {
+                                const item = node.children[entry];
+                                logAndDisplay(entry + (item.type === 'dir' ? '/' : ''));
+                            });
+                        }
+                    } else {
+                        logAndDisplay(`ls: ${targetPath}: No such file or directory`);
+                    }
+                    break;
+                case 'cd':
+                    targetPath = args.length === 0 ? '/home/user' : args.join(' '); // Default to home
+                    const newAbsolutePath = resolvePath(currentWorkingDirectoryPath, targetPath);
+                    node = getNodeAtPath(newAbsolutePath, '/'); // Check resolved absolute path from root
+
+                    if (node && node.type === 'dir') {
+                        currentWorkingDirectoryPath = newAbsolutePath;
+                        updatePrompt();
+                    } else {
+                        logAndDisplay(`cd: ${targetPath}: No such directory or not a directory`);
+                    }
+                    break;
+                case 'pwd':
+                    logAndDisplay(currentWorkingDirectoryPath);
+                    break;
+                case 'cat':
+                    if (args.length === 0) { logAndDisplay("cat: missing filename"); break; }
+                    targetPath = args.join(' ');
+                    node = getNodeAtPath(targetPath);
+                    if (node && node.type === 'file') {
+                        (node.content || '').split('\n').forEach(line => logAndDisplay(line));
+                    } else {
+                        logAndDisplay(`cat: ${targetPath}: No such file or not a file`);
+                    }
+                    break;
+                case 'mkdir':
+                    if (args.length === 0) { logAndDisplay("mkdir: missing operand"); break; }
+                    targetPath = args.join(' ');
+                    const { parentNode: mkParent, name: mkDirName } = getParentNodeAndName(targetPath);
+
+                    if (mkParent && mkParent.type === 'dir') {
+                        if (!mkParent.children) mkParent.children = {};
+                        if (mkParent.children[mkDirName]) {
+                            logAndDisplay(`mkdir: cannot create directory ‘${mkDirName}’: File or directory exists`);
+                        } else {
+                            mkParent.children[mkDirName] = { type: 'dir', children: {} };
+                            saveFSToLocalStorage();
+                        }
+                    } else {
+                        logAndDisplay(`mkdir: cannot create directory ‘${targetPath}’: Parent directory does not exist or is not a directory`);
+                    }
+                    break;
+                case 'touch':
+                    if (args.length === 0) { logAndDisplay("touch: missing file operand"); break; }
+                    targetPath = args.join(' ');
+                    const { parentNode: touchParent, name: touchFileName } = getParentNodeAndName(targetPath);
+
+                    if (touchParent && touchParent.type === 'dir') {
+                        if (!touchParent.children) touchParent.children = {};
+                        if (touchParent.children[touchFileName] && touchParent.children[touchFileName].type === 'dir') {
+                             logAndDisplay(`touch: cannot touch ‘${touchFileName}’: Is a directory`);
+                        } else {
+                            if (!touchParent.children[touchFileName]) { // Create if not exists
+                                touchParent.children[touchFileName] = { type: 'file', content: '' };
+                            } // If it exists and is a file, 'touch' effectively updates mtime (not implemented here)
+                            saveFSToLocalStorage();
+                        }
+                    } else {
+                        logAndDisplay(`touch: cannot touch ‘${targetPath}’: Parent directory does not exist or is not a directory`);
+                    }
+                    break;
+                case 'echo':
+                    content = command.substring(command.indexOf(' ') + 1).trim();
+                    let echoMode = 'overwrite'; // Default is '>'
+                    let opIdx = content.lastIndexOf('>>');
+                    if (opIdx > 0) { // Found '>>' and it's not at the beginning
+                        echoMode = 'append';
+                    } else {
+                        opIdx = content.lastIndexOf('>');
+                        if (opIdx === -1 || opIdx === 0) { // No redirection or invalid (e.g., "> file")
+                            logAndDisplay(content); // Just echo the content
+                            break;
+                        }
+                    }
+
+                    const txtEcho = content.substring(0, opIdx).trim().replace(/^["']|["']$/g, ''); // Remove surrounding quotes
+                    targetPath = content.substring(opIdx + (echoMode === 'append' ? 2 : 1)).trim();
+                    if (!targetPath) { logAndDisplay("echo: missing filename for redirection."); break; }
+
+                    const { parentNode: echoParent, name: echoFileName } = getParentNodeAndName(targetPath);
+
+                    if (echoParent && echoParent.type === 'dir') {
+                        if (!echoParent.children) echoParent.children = {};
+                        let fileNode = echoParent.children[echoFileName];
+
+                        if (fileNode && fileNode.type === 'dir') {
+                            logAndDisplay(`echo: cannot write to ‘${echoFileName}’: Is a directory`);
+                            break;
+                        }
+                        if (!fileNode) { // Create file if it doesn't exist
+                            fileNode = { type: 'file', content: '' };
+                            echoParent.children[echoFileName] = fileNode;
+                        }
+                        if (echoMode === 'append') {
+                            fileNode.content += (fileNode.content ? '\n' : '') + txtEcho;
+                        } else { // overwrite
+                            fileNode.content = txtEcho;
+                        }
+                        saveFSToLocalStorage();
+                    } else {
+                        logAndDisplay(`echo: cannot write to ‘${targetPath}’: Parent directory does not exist or is not a directory`);
+                    }
+                    break;
+                case 'rm':
+                    let recursive = false;
+                    let pathArgIdx = 0;
+                    if (args.length > 0 && args[0] === '-r') {
+                        recursive = true;
+                        pathArgIdx = 1;
+                    }
+                    if (args.length <= pathArgIdx) { logAndDisplay("rm: missing operand"); break; }
+                    targetPath = args.slice(pathArgIdx).join(' ');
+                    const resolvedRmPath = resolvePath(currentWorkingDirectoryPath, targetPath);
+
+                    if (resolvedRmPath === '/') { logAndDisplay("rm: cannot remove root directory '/'"); break; }
+
+                    const { parentNode: rmParent, name: rmName } = getParentNodeAndName(resolvedRmPath, '/');
+
+                    if (rmParent && rmParent.children && rmParent.children[rmName]) {
+                        const itemToRemove = rmParent.children[rmName];
+                        if (itemToRemove.type === 'dir' && Object.keys(itemToRemove.children || {}).length > 0 && !recursive) {
+                            logAndDisplay(`rm: cannot remove ‘${rmName}’: Directory not empty. Use -r to remove recursively.`);
+                        } else {
+                            delete rmParent.children[rmName];
+                            saveFSToLocalStorage();
+                            logAndDisplay(`Removed ‘${targetPath}’` + (itemToRemove.type === 'dir' && recursive ? " (recursively)" : ""));
+                        }
+                    } else {
+                        logAndDisplay(`rm: cannot remove ‘${targetPath}’: No such file or directory`);
+                    }
+                    break;
+                case 'cp':
+                    if (args.length < 2) { logAndDisplay("cp: missing file operand. Usage: cp <source> <destination>"); break; }
+                    const cpSourceArg = args[0];
+                    const cpDestArg = args[1];
+
+                    const resolvedCpSourcePath = resolvePath(currentWorkingDirectoryPath, cpSourceArg);
+                    if (resolvedCpSourcePath === '/') { logAndDisplay("cp: cannot copy root directory '/'"); break; }
+                    const cpSourceNode = getNodeAtPath(resolvedCpSourcePath, '/');
+
+                    if (!cpSourceNode) { logAndDisplay(`cp: cannot stat '${cpSourceArg}': No such file or directory`); break; }
+
+                    let resolvedCpDestPath = resolvePath(currentWorkingDirectoryPath, cpDestArg);
+                    let cpDestParentNode, cpDestName;
+                    let destNode = getNodeAtPath(resolvedCpDestPath, '/'); // Check if destination exists
+
+                    if (destNode && destNode.type === 'dir') { // Copying into an existing directory
+                        cpDestParentNode = destNode;
+                        cpDestName = resolvedCpSourcePath.substring(resolvedCpSourcePath.lastIndexOf('/') + 1); // Name of source
+                        resolvedCpDestPath = resolvePath(resolvedCpDestPath, cpDestName); // Full path of the new item in dest dir
+                    } else { // Copying to a new file/dir name, or overwriting existing file
+                        const { parentNode: pNode, name: n } = getParentNodeAndName(resolvedCpDestPath, '/');
+                        cpDestParentNode = pNode;
+                        cpDestName = n;
+                    }
+
+                    if (!cpDestParentNode || cpDestParentNode.type !== 'dir') {
+                        logAndDisplay(`cp: cannot create '${cpDestArg}': Destination parent directory does not exist or is not a directory`);
+                        break;
+                    }
+                    if (cpSourceNode.type === 'dir' && resolvedCpDestPath.startsWith(resolvedCpSourcePath + (resolvedCpSourcePath === '/' ? '' : '/'))) {
+                        logAndDisplay(`cp: cannot copy a directory, '${cpSourceArg}', into itself or a subdirectory, '${cpDestArg}'`);
+                        break;
+                    }
+
+                    if (!cpDestParentNode.children) cpDestParentNode.children = {};
+                    // Conflict checks
+                    if (cpDestParentNode.children[cpDestName] && cpDestParentNode.children[cpDestName].type === 'dir' && cpSourceNode.type === 'file') {
+                        logAndDisplay(`cp: cannot overwrite directory '${cpDestName}' with non-directory '${cpSourceArg}'`);
+                        break;
+                    }
+                     if (cpDestParentNode.children[cpDestName] && cpSourceNode.type === 'dir' && cpDestParentNode.children[cpDestName].type === 'file') {
+                        logAndDisplay(`cp: cannot overwrite non-directory '${cpDestName}' with directory '${cpSourceArg}'`);
+                        break;
+                    }
+
+                    cpDestParentNode.children[cpDestName] = deepCopyNode(cpSourceNode);
+                    saveFSToLocalStorage();
+                    logAndDisplay(`Copied '${cpSourceArg}' to '${cpDestArg}'`);
+                    break;
+
+                case 'mv':
+                    if (args.length < 2) { logAndDisplay("mv: missing file operand. Usage: mv <source> <destination>"); break; }
+                    const mvSourceArg = args[0];
+                    const mvDestArg = args[1];
+
+                    const resolvedMvSourcePath = resolvePath(currentWorkingDirectoryPath, mvSourceArg);
+                    if (resolvedMvSourcePath === '/') { logAndDisplay("mv: cannot move root directory '/'"); break; }
+
+                    const { parentNode: mvSourceParentNode, name: mvSourceName } = getParentNodeAndName(resolvedMvSourcePath, '/');
+                    const mvSourceNode = getNodeAtPath(resolvedMvSourcePath, '/'); // Get the actual source node object
+
+                    if (!mvSourceNode) { logAndDisplay(`mv: cannot stat '${mvSourceArg}': No such file or directory`); break; }
+
+                    let resolvedMvDestPath = resolvePath(currentWorkingDirectoryPath, mvDestArg);
+                    let mvDestParentNode, mvDestName;
+                    let mvDestExistingNode = getNodeAtPath(resolvedMvDestPath, '/');
+
+                    if (mvDestExistingNode && mvDestExistingNode.type === 'dir') { // Moving into an existing directory
+                        mvDestParentNode = mvDestExistingNode;
+                        mvDestName = resolvedMvSourcePath.substring(resolvedMvSourcePath.lastIndexOf('/') + 1);
+                        resolvedMvDestPath = resolvePath(resolvedMvDestPath, mvDestName);
+                    } else {
+                        const { parentNode: pNode, name: n } = getParentNodeAndName(resolvedMvDestPath, '/');
+                        mvDestParentNode = pNode;
+                        mvDestName = n;
+                    }
+
+                    if (!mvDestParentNode || mvDestParentNode.type !== 'dir') {
+                        logAndDisplay(`mv: cannot move to '${mvDestArg}': Destination parent directory does not exist or is not a directory`);
+                        break;
+                    }
+                    if (resolvedMvSourcePath === resolvedMvDestPath) {
+                        logAndDisplay(`mv: '${mvSourceArg}' and '${mvDestArg}' are the same file or directory`);
+                        break;
+                    }
+                    if (mvSourceNode.type === 'dir' && resolvedMvDestPath.startsWith(resolvedMvSourcePath + (resolvedMvSourcePath === '/' ? '' : '/'))) {
+                        logAndDisplay(`mv: cannot move a directory, '${mvSourceArg}', into itself or a subdirectory, '${mvDestArg}'`);
+                        break;
+                    }
+
+                    if (!mvDestParentNode.children) mvDestParentNode.children = {};
+                    // Conflict checks for mv
+                    if (mvDestParentNode.children[mvDestName]) {
+                        if (mvSourceNode.type === 'dir' && mvDestParentNode.children[mvDestName].type === 'file') {
+                            logAndDisplay(`mv: cannot overwrite non-directory '${mvDestName}' with directory '${mvSourceArg}'`);
+                            break;
+                        }
+                        if (mvSourceNode.type === 'file' && mvDestParentNode.children[mvDestName].type === 'dir') {
+                            logAndDisplay(`mv: cannot overwrite directory '${mvDestName}' with non-directory '${mvSourceArg}'`);
+                            break;
+                        }
+                        logAndDisplay(`mv: overwriting '${resolvedMvDestPath}'`);
+                    }
+
+                    mvDestParentNode.children[mvDestName] = mvSourceNode; // Assign (move) the actual node object
+
+                    // Delete from original location
+                    if (mvSourceParentNode && mvSourceParentNode.children && mvSourceParentNode.children[mvSourceName]) {
+                        delete mvSourceParentNode.children[mvSourceName];
+                    } else if (resolvedMvSourcePath !== '/') { // Check if source was not root, if parent not found its an error
+                        logAndDisplay(`mv: critical error - source parent for '${mvSourceName}' not found for deletion. Operation may be incomplete.`);
+                        // Attempt to rollback by removing the newly placed node if it's the one we just put
+                        if (mvDestParentNode.children[mvDestName] === mvSourceNode) {
+                             delete mvDestParentNode.children[mvDestName];
+                        }
+                        break;
+                    }
+
+                    saveFSToLocalStorage();
+                    logAndDisplay(`Moved '${mvSourceArg}' to '${mvDestArg}'`);
+                    break;
+                case 'run':
+                    if (args.length === 0) { logAndDisplay("run: missing filename"); break; }
+                    targetPath = args.join(' ');
+                    node = getNodeAtPath(targetPath);
+                    if (node && node.type === 'file' && node.content) {
+                        try {
+                            logAndDisplay("Running " + targetPath + "...");
+                            // WARNING: eval can be dangerous if the content is not trusted.
+                            // For this mock system, we expose some utilities to the script.
+                            (function(logFn, fs, cwd, getNodeFn, resolvePathFn) {
+                                eval(node.content);
+                            })(logAndDisplay, mockFS, currentWorkingDirectoryPath, getNodeAtPath, resolvePath);
+                        } catch (e) {
+                            logAndDisplay("Error in " + targetPath + ": " + e.message);
+                            console.error("Error running script:", e);
+                        }
+                    } else {
+                        logAndDisplay("run: cannot run ‘" + targetPath + "’: No such file or no executable content");
+                    }
+                    break;
+                case 'loadhtml':
+                    if (args.length === 0) { logAndDisplay("loadhtml: missing filename"); break; }
+                    targetPath = args.join(' ');
+                    node = getNodeAtPath(targetPath);
+                    if (node && node.type === 'file' && node.content) {
+                        // WARNING: Directly setting innerHTML from file content can be an XSS risk if content is untrusted.
+                        mainViewContentCache.main = node.content;
+                        currentMainViewMode = 'main';
+                        renderMainView();
+                        logAndDisplay("Loaded " + targetPath + " into main view.");
+                    } else {
+                        logAndDisplay("loadhtml: cannot load ‘" + targetPath + "’: No such file or no content");
+                    }
+                    break;
+                case 'edit':
+                    if (args.length === 0) { logAndDisplay("Usage: edit <filepath>"); break; }
+                    targetPath = args.join(' ');
+                    const resolvedEditPath = resolvePath(currentWorkingDirectoryPath, targetPath);
+                    node = getNodeAtPath(resolvedEditPath, '/');
+                    if (node && node.type === 'file') {
+                        editingFilePath = resolvedEditPath;
+                        currentMainViewMode = 'edit';
+                        renderMainView();
+                        logAndDisplay(`Now editing ${editingFilePath}. View in main panel. Use 'saveedit' or the save button to save changes.`);
+                    } else {
+                        logAndDisplay(`edit: cannot edit '${targetPath}': No such file or not a file.`);
+                    }
+                    break;
+                case 'saveedit':
+                    saveEditedFile();
+                    break;
+                case 'viewmode':
+                    if (args.length === 0) {
+                        logAndDisplay(`Current main view mode: ${currentMainViewMode}. Available: ${mainViewModesCycleOrder.join(', ')}. (Use Alt+M to cycle)`);
+                        break;
+                    }
+                    const newMode = args[0].toLowerCase();
+                    if (mainViewModesCycleOrder.includes(newMode)) {
+                        if (newMode === 'edit' && !editingFilePath) {
+                            logAndDisplay("Switched to edit mode. Use `edit <filepath>` to load a file for editing.");
+                        }
+                        currentMainViewMode = newMode;
+                        renderMainView();
+                        logAndDisplay(`Main view mode switched to: ${currentMainViewMode}`);
+                    } else {
+                        logAndDisplay(`Invalid view mode: ${newMode}. Available modes: ${mainViewModesCycleOrder.join(', ')}`);
+                    }
+                    break;
+                case 'size': handleSizeCommand(args); break;
+                case 'bgcolor': handleBgColorCommand(args); break;
+                case 'clear': terminalOutputLog = []; if (isTerminalActive && terminalUi.output) terminalUi.output.textContent = ''; rerenderTerminalOutput(); break;
+                case 'date': logAndDisplay(new Date().toString()); break;
+                case 'about': logAndDisplay('Browser-Based Mock Terminal & File System (v2.3)'); break;
+                case 'exit': deactivateTerminal(); break;
+                case '': break; // Handle empty command (just new prompt)
+                default:
+                    // If it's 'echo' without redirection, handle it here as a fallback.
+                    if (command.trim().toLowerCase().startsWith('echo ')) {
+                         logAndDisplay(command.substring(5));
+                    } else {
+                        logAndDisplay('Unknown command: ' + cmd + ". Type 'help' for available commands.");
+                    }
+            }
+            if (terminalUi.input) terminalUi.input.focus(); // Refocus input after command processing
+        }
+
+        /**
+         * Handles the `bgcolor` command for changing page and terminal background colors.
+         * @param {string[]} args - Arguments passed to the bgcolor command.
+         */
+        function handleBgColorCommand(args) {
+            if (args.length < 1) { displayHelp(); return; } // Show help if no args
+            const type = args[0].toLowerCase();
+            let colorChanged = false;
+
+            if (type === 'reset') {
+                currentBgColors = JSON.parse(JSON.stringify(bgColorPresets.default));
+                logAndDisplay("Background colors reset to default preset.");
+                colorChanged = true;
+            } else if (type === 'preset') {
+                if (args.length < 2) { logAndDisplay("Specify preset name: " + Object.keys(bgColorPresets).join(', ')); return; }
+                const presetName = args[1].toLowerCase();
+                if (bgColorPresets[presetName]) {
+                    currentBgColors = JSON.parse(JSON.stringify(bgColorPresets[presetName]));
+                    logAndDisplay("Color preset '" + presetName + "' loaded.");
+                    colorChanged = true;
+                } else { logAndDisplay("Unknown preset: " + presetName); return; }
+            } else if (type === 'page' || type === 'term') {
+                if (args.length < 2) { logAndDisplay("Specify color for '" + type + "'. Example: bgcolor " + type + " blue"); return; }
+                currentBgColors[type] = args[1];
+                logAndDisplay("Background for '" + type + "' set to '" + args[1] + "'.");
+                colorChanged = true;
+            } else {
+                logAndDisplay("Invalid bgcolor type. Use 'page', 'term', 'preset', or 'reset'."); return;
+            }
+
+            if (colorChanged) {
+                applyBackgroundColors(); // Applies to body and potentially active terminal, then refreshes layout
+            }
+        }
+
+        /**
+         * Handles the `size` command for adjusting terminal split percentage.
+         * @param {string[]} args - Arguments passed to the size command.
+         */
+        function handleSizeCommand(args) {
+            if (!isTerminalActive) { logAndDisplay("Terminal not active. Size command is not applicable."); return; }
+
+            const logicalLayoutConfig = viewCycleConfig[currentCycleIndex];
+            if (!logicalLayoutConfig) { logAndDisplay("Cannot determine current view context for size command."); return; }
+            const logicalMode = logicalLayoutConfig.layout; // The mode in the cycle sequence
+
+            if (args.length === 1 && args[0].toLowerCase() === 'default') {
+                if (isSplitViewMode(logicalMode)) {
+                    const defaultConfig = viewCycleConfig.find(v => v.layout === logicalMode);
+                    if (defaultConfig) {
+                        currentSplitPercentage = defaultConfig.percentage;
+                        delete customSplitPercentages[logicalMode]; // Reset custom setting for this logical mode
+                        logAndDisplay(`Size for ${logicalMode} view reset to default ${currentSplitPercentage}%.`);
+                        currentLayoutMode = logicalMode; // Ensure displayed mode is the logical split mode
+                        applyLayout();
+                    } else { // Should not happen if viewCycleConfig is correct
+                        logAndDisplay(`Error: Could not find default configuration for ${logicalMode}.`);
+                    }
+                } else {
+                    logAndDisplay("The `size default` command is applicable when the current view in the cycle is a split-screen mode.");
+                }
+                if (terminalUi.input) terminalUi.input.focus();
+                return;
+            }
+
+            if (!isSplitViewMode(logicalMode)) {
+                logAndDisplay("Size adjustment commands (+, -, +/-N) apply when the current view in the cycle is a split-screen mode.");
+                if (terminalUi.input) terminalUi.input.focus();
+                return;
+            }
+
+            let change = 0;
+            const FIXED_INCREMENT = 5; // Fixed increment/decrement for simple '+' and '-'
+
+            if (args.length === 1 && args[0] === '+') {
+                change = FIXED_INCREMENT;
+            } else if (args.length === 1 && args[0] === '-') {
+                change = -FIXED_INCREMENT;
+            } else if (args.length > 0) {
+                const arg = args[0];
+                let valStr = arg.substring(1); // Assume format like +N or -N
+                if (arg.endsWith('%')) valStr = arg.substring(1, arg.length - 1);
+                let val = parseInt(valStr, 10);
+
+                if (isNaN(val)) {
+                    logAndDisplay("Invalid size value. Use a number, e.g., +10, -20, or +15%."); return;
+                }
+
+                if (arg.charAt(0) === '+') { change = val; }
+                else if (arg.charAt(0) === '-') { change = -val; }
+                else { logAndDisplay("Invalid size format. Use '+', '-', '+N[%]', '-N[%]', or 'default'."); return; }
+            } else { // No arguments, show help for size
+                 logAndDisplay("Usage: size [ + | - | +/-N[%] | default ]");
+                 if (terminalUi.input) terminalUi.input.focus();
+                 return;
+            }
+
+            // Get base percentage: custom if set, otherwise from cycle config for the logical mode
+            let basePercentage = customSplitPercentages[logicalMode] !== undefined ?
+                                 customSplitPercentages[logicalMode] :
+                                 logicalLayoutConfig.percentage;
+            let newPercentage = basePercentage + change;
+
+            // Update currentSplitPercentage for display and customSplitPercentages for persistence
+            if (newPercentage <= 0) {
+                currentSplitPercentage = 0;
+                customSplitPercentages[logicalMode] = 0;
+                currentLayoutMode = VIEW_MAIN_FULL; // Display as main full
+                logAndDisplay(`Terminal size for ${logicalMode} view is now 0%. Displaying Main Full.`);
+            } else if (newPercentage >= 100) {
+                currentSplitPercentage = 100;
+                customSplitPercentages[logicalMode] = 100;
+                currentLayoutMode = VIEW_TERM_FULL; // Display as term full
+                logAndDisplay(`Terminal size for ${logicalMode} view is now 100%. Displaying Term Full.`);
+            } else {
+                currentSplitPercentage = newPercentage;
+                customSplitPercentages[logicalMode] = newPercentage;
+                currentLayoutMode = logicalMode; // Ensure we are displaying the logical split mode itself
+                logAndDisplay(`Terminal size for ${logicalMode} view set to ${currentSplitPercentage}%.`);
+            }
+
+            applyLayout();
+            if (terminalUi.input) terminalUi.input.focus();
+        }
+
+        /**
+         * Checks if a given layout mode is a split-screen view.
+         * @param {string} mode - The layout mode to check.
+         * @returns {boolean} True if it's a split view, false otherwise.
+         */
+        function isSplitViewMode(mode) {
+            return mode === VIEW_SPLIT_TERM_LEFT || mode === VIEW_SPLIT_TERM_RIGHT ||
+                   mode === VIEW_SPLIT_TERM_TOP || mode === VIEW_SPLIT_TERM_BOTTOM;
+        }
+
+        /**
+         * Applies the configured background and text colors to the active terminal elements.
+         */
+        function applyTerminalElementColors() {
+            if (!terminalHolder || !isTerminalActive) return; // Only if terminal holder exists and is active
+
+            terminalHolder.style.backgroundColor = currentBgColors.term;
+
+            const termBg = currentBgColors.term.toLowerCase();
+            // Basic check for dark background for text color inversion
+            // More sophisticated check (e.g., Luma) could be used for wider color range
+            const isDarkTerm = termBg === 'black' || termBg === '#000' || termBg === '#000000' ||
+                               termBg.startsWith('#0') || termBg.startsWith('#1') || // Covers #000 to #1ff...
+                               termBg.startsWith('#2') || termBg.startsWith('#3');   // Covers #200 to #3ff...
+            const textColor = isDarkTerm ? 'white' : 'black';
+
+            if (terminalUi.output) terminalUi.output.style.color = textColor;
+            if (terminalUi.input) terminalUi.input.style.color = textColor;
+        }
+
+
+        /**
+         * Creates and configures the DOM elements for the terminal interface (output and input).
+         */
+        function createTerminalDOMElements() {
+            terminalHolder.innerHTML = ''; // Clear any previous content (e.g., "Terminal Inactive" text)
+
+            const inputHeight = "22px"; // Height for the input field row
+            const table = document.createElement('table');
+            table.style.width = '100%';
+            table.style.height = '100%';
+            table.style.borderCollapse = 'collapse';
+            table.style.tableLayout = 'fixed'; // Helps with consistent cell sizing
+
+            // Output Row
+            const trOut = table.insertRow();
+            trOut.style.height = `calc(100% - ${inputHeight})`;
+            const tdOut = trOut.insertCell();
+            tdOut.style.padding = '0';
+            tdOut.style.verticalAlign = 'top'; // Content starts at the top
+
+            terminalUi.output = document.createElement('pre');
+            terminalUi.output.style.height = '100%';
+            terminalUi.output.style.width = '100%';
+            terminalUi.output.style.overflowY = 'auto'; // Enable vertical scrollbar for output
+            terminalUi.output.style.margin = '0';
+            terminalUi.output.style.padding = '2px'; // Small internal padding
+            terminalUi.output.style.whiteSpace = 'pre-wrap'; // Wrap long lines
+            terminalUi.output.style.wordBreak = 'break-all'; // Break long words
+            terminalUi.output.style.boxSizing = 'border-box'; // Include padding/border in element's total width/height
+            tdOut.appendChild(terminalUi.output);
+
+            // Input Row
+            const trIn = table.insertRow();
+            trIn.style.height = inputHeight;
+            const tdIn = trIn.insertCell();
+            tdIn.style.padding = '0';
+            tdIn.style.verticalAlign = 'bottom'; // Input field at the bottom of its cell
+
+            terminalUi.input = document.createElement('input');
+            terminalUi.input.type = 'text';
+            terminalUi.input.setAttribute('aria-label', 'Terminal command input');
+            terminalUi.input.style.width = '100%';
+            terminalUi.input.style.height = '100%';
+            terminalUi.input.style.border = 'none'; // No border
+            terminalUi.input.style.outline = 'none'; // No focus outline
+            terminalUi.input.style.background = 'transparent'; // Inherit background from parent
+            terminalUi.input.style.color = 'inherit'; // Inherit text color from parent
+            terminalUi.input.style.padding = '0 2px'; // Horizontal padding for text
+            terminalUi.input.style.fontFamily = 'monospace'; // Consistent font
+            terminalUi.input.style.fontSize = '1em';       // Consistent font size
+            terminalUi.input.style.boxSizing = 'border-box';
+            terminalUi.input.addEventListener('keydown', handleTerminalInputKeydown);
+            tdIn.appendChild(terminalUi.input);
+
+            terminalHolder.appendChild(table);
+            applyTerminalElementColors(); // Apply background and text colors now that elements exist
+        }
+
+        /**
+         * Removes the terminal DOM elements and cleans up event listeners.
+         */
+        function destroyTerminalDOMElements() {
+            if (terminalUi.input) {
+                terminalUi.input.removeEventListener('keydown', handleTerminalInputKeydown);
+            }
+            terminalHolder.innerHTML = ''; // Clear the internal table structure
+            terminalUi.output = null;
+            terminalUi.input = null;
+            terminalHolder.style.backgroundColor = ''; // Remove direct style
+        }
+
+        /**
+         * Handles keydown events on the terminal input field (Enter, ArrowUp, ArrowDown).
+         * @param {KeyboardEvent} event - The keyboard event.
+         */
+        function handleTerminalInputKeydown(event) {
+            if (!isTerminalActive) return;
+
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                const command = terminalUi.input.value;
+                logAndDisplay(command, true); // Echo command with prompt
+                if (command.trim() !== '') { // Add to history if not empty
+                    commandHistory = commandHistory.filter(c => c !== command); // Remove duplicates
+                    commandHistory.push(command);
+                    if(commandHistory.length > 50) commandHistory.shift(); // Limit history size
+                }
+                historyIndex = -1; // Reset history navigation index
+                processCommand(command);
+                terminalUi.input.value = ''; // Clear input field
+                if (terminalUi.input) terminalUi.input.focus(); // Refocus
+                if(terminalUi.output) terminalUi.output.scrollTop = terminalUi.output.scrollHeight; // Scroll output
+            } else if (event.key === 'ArrowUp') {
+                if (commandHistory.length > 0) {
+                    event.preventDefault();
+                    if (historyIndex === -1) historyIndex = commandHistory.length - 1; // Start from newest
+                    else if (historyIndex > 0) historyIndex--;
+                    terminalUi.input.value = commandHistory[historyIndex];
+                    terminalUi.input.setSelectionRange(terminalUi.input.value.length, terminalUi.input.value.length); // Move cursor to end
+                }
+            } else if (event.key === 'ArrowDown') {
+                if (commandHistory.length > 0 && historyIndex !== -1) {
+                    event.preventDefault();
+                    if (historyIndex < commandHistory.length - 1) {
+                        historyIndex++;
+                        terminalUi.input.value = commandHistory[historyIndex];
+                    } else { // Reached end of history (newer commands)
+                        historyIndex = -1;
+                        terminalUi.input.value = ''; // Clear input
+                    }
+                    terminalUi.input.setSelectionRange(terminalUi.input.value.length, terminalUi.input.value.length);
+                }
+            }
+        }
+
+        /**
+         * Deactivates the terminal, reverting to the main full view.
+         */
+        function deactivateTerminal() {
+            if (!isTerminalActive) return;
+            isTerminalActive = false;
+            destroyTerminalDOMElements();
+            currentLayoutMode = VIEW_MAIN_FULL; // Revert to main content full view
+            currentCycleIndex = viewCycleConfig.findIndex(v=>v.layout===VIEW_MAIN_FULL); // Reset cycle index
+            renderMainView(); // Ensure main view content is current
+            applyLayout();
+            document.body.focus(); // Remove focus from any terminal element
+            console.log("Terminal Deactivated.");
+        }
+
+        /**
+         * Handles Ctrl+` key press to toggle terminal activation and cycle through layout views.
+         */
+        function handleCtrlBacktick() {
+            currentCycleIndex++; // Advance to the next view in the cycle
+
+            // If terminal is not active and we're past the end of cycle, loop to start
+            if (!isTerminalActive && currentCycleIndex >= viewCycleConfig.length) {
+                currentCycleIndex = 0;
+            }
+
+            // If we've cycled past the end of defined views
+            if (currentCycleIndex >= viewCycleConfig.length) {
+                if (isTerminalActive) { // If terminal was active, deactivate it
+                    deactivateTerminal(); return;
+                } else { // Should not happen if logic above is correct, but as a fallback, loop cycle
+                    currentCycleIndex = 0;
+                }
+            }
+
+            // Activate terminal if it's not already
+            if (!isTerminalActive) {
+                isTerminalActive = true;
+                createTerminalDOMElements(); // Create terminal elements synchronously
+                updatePrompt();
+                if (terminalOutputLog.length === 0) {
+                    logAndDisplay('Welcome! Type `help` for a list of commands.');
+                } else {
+                    rerenderTerminalOutput(); // Restore previous output
+                }
+            }
+
+            const targetViewConfig = viewCycleConfig[currentCycleIndex];
+            if (targetViewConfig) {
+                let newLayoutModeForDisplay = targetViewConfig.layout;
+                let newPercentageForDisplay = targetViewConfig.percentage; // Default from cycle config
+
+                // If target is a split view, check for a custom percentage
+                if (isSplitViewMode(targetViewConfig.layout) && customSplitPercentages[targetViewConfig.layout] !== undefined) {
+                    newPercentageForDisplay = customSplitPercentages[targetViewConfig.layout];
+                }
+
+                // Determine actual layout to display based on the (potentially custom) percentage
+                if (isSplitViewMode(targetViewConfig.layout)) {
+                    if (newPercentageForDisplay <= 0) {
+                        currentLayoutMode = VIEW_MAIN_FULL; currentSplitPercentage = 0;
+                    } else if (newPercentageForDisplay >= 100) {
+                        currentLayoutMode = VIEW_TERM_FULL; currentSplitPercentage = 100;
+                    } else { // Standard split view
+                        currentLayoutMode = targetViewConfig.layout; currentSplitPercentage = newPercentageForDisplay;
+                    }
+                } else { // It's VIEW_MAIN_FULL or VIEW_TERM_FULL from config, use as is
+                    currentLayoutMode = targetViewConfig.layout;
+                    currentSplitPercentage = targetViewConfig.percentage; // Will be 0 or 100
+                }
+                 console.log(`Layout Cycle #${currentCycleIndex}: Displaying ${currentLayoutMode} (logical: ${targetViewConfig.layout}) @ ${currentSplitPercentage}%`);
+            } else { // Should not happen with a valid viewCycleConfig
+                console.error("Error: No view configuration for cycle index " + currentCycleIndex + ". Resetting terminal.");
+                currentCycleIndex = -1; // Reset cycle
+                deactivateTerminal(); return;
+            }
+
+            applyLayout(); // Apply the chosen layout
+            // Focus management
+            if (isTerminalActive && terminalUi.input && currentLayoutMode !== VIEW_MAIN_FULL) {
+                terminalUi.input.focus();
+            } else if (isTerminalActive && currentLayoutMode === VIEW_MAIN_FULL) {
+                document.body.focus(); // Or terminalUi.input.blur();
+            }
+        }
+
+        /**
+         * Applies the current layout to the application container using an HTML table.
+         */
+        function applyLayout() {
+            appContainer.innerHTML = ''; // Clear previous layout
+            const table = document.createElement('table');
+            table.style.width = '100%';
+            table.style.height = '100vh'; // Full viewport height
+            table.style.borderCollapse = 'collapse';
+            table.setAttribute('cellpadding', '0'); // No cell padding
+            table.setAttribute('cellspacing', '0'); // No cell spacing
+
+            // Ensure mainContentHolder and terminalHolder are prepared for insertion
+            mainContentHolder.style.display = ''; // Make visible if it was hidden
+            terminalHolder.style.display = '';   // Make visible if it was hidden
+            mainContentHolder.style.height = '100%';
+            mainContentHolder.style.overflow = 'auto'; // Scroll main content if it overflows
+            terminalHolder.style.height = '100%';
+            terminalHolder.style.overflow = 'hidden'; // Terminal manages its own internal scroll
+
+            let r1, c1, c2, r2; // Table row and cell variables
+
+            switch(currentLayoutMode){
+                case VIEW_MAIN_FULL:
+                    r1=table.insertRow(); c1=r1.insertCell(); c1.appendChild(mainContentHolder);
+                    c1.style.height = '100%';
+                    break;
+                case VIEW_TERM_FULL:
+                    if(isTerminalActive){
+                        r1=table.insertRow(); c1=r1.insertCell(); c1.appendChild(terminalHolder);
+                        c1.style.height = '100%';
+                    } else { // Terminal not active, but requested term_full: revert to main_full
+                        currentLayoutMode=VIEW_MAIN_FULL; applyLayout(); return;
+                    }
+                    break;
+                case VIEW_SPLIT_TERM_LEFT:
+                    r1=table.insertRow(); c1=r1.insertCell(); c2=r1.insertCell();
+                    if(isTerminalActive){ c1.appendChild(terminalHolder); }
+                    else { c1.appendChild(document.createTextNode(" ")); } // Placeholder if term inactive
+                    c2.appendChild(mainContentHolder);
+                    c1.style.width = currentSplitPercentage+'%'; c2.style.width = (100-currentSplitPercentage)+'%';
+                    r1.style.height='100%';
+                    break;
+                case VIEW_SPLIT_TERM_RIGHT:
+                    r1=table.insertRow(); c1=r1.insertCell(); c2=r1.insertCell();
+                    c1.appendChild(mainContentHolder);
+                    if(isTerminalActive){ c2.appendChild(terminalHolder); }
+                    else { c2.appendChild(document.createTextNode(" ")); }
+                    c1.style.width = (100-currentSplitPercentage)+'%'; c2.style.width = currentSplitPercentage+'%';
+                    r1.style.height='100%';
+                    break;
+                case VIEW_SPLIT_TERM_TOP:
+                    r1=table.insertRow(); c1=r1.insertCell();
+                    if(isTerminalActive){ c1.appendChild(terminalHolder); }
+                    else { c1.appendChild(document.createTextNode(" ")); }
+                    c1.style.height = currentSplitPercentage+'%';
+                    r2=table.insertRow(); c2=r2.insertCell(); c2.appendChild(mainContentHolder);
+                    c2.style.height = (100-currentSplitPercentage)+'%';
+                    break;
+                case VIEW_SPLIT_TERM_BOTTOM:
+                    r1=table.insertRow(); c1=r1.insertCell(); c1.appendChild(mainContentHolder);
+                    c1.style.height = (100-currentSplitPercentage)+'%';
+                    r2=table.insertRow(); c2=r2.insertCell();
+                    if(isTerminalActive){ c2.appendChild(terminalHolder); }
+                    else { c2.appendChild(document.createTextNode(" ")); }
+                    c2.style.height = currentSplitPercentage+'%';
+                    break;
+            }
+            appContainer.appendChild(table);
+            // Ensure terminal output scrolls if content was added while hidden
+            if (isTerminalActive && terminalUi.output) terminalUi.output.scrollTop = terminalUi.output.scrollHeight;
+        }
+
+        // --- Global Keydown Event Listener ---
+        document.addEventListener('keydown', function(event) {
+            // Ctrl+` or Ctrl+~: Toggle terminal and cycle layouts
+            if (event.ctrlKey && (event.key === '`' || event.key === '~')) {
+                event.preventDefault();
+                handleCtrlBacktick();
+            }
+            // Alt+M: Cycle main application view modes
+            else if (event.altKey && event.key.toLowerCase() === 'm') {
+                event.preventDefault();
+                let currentModeIndex = mainViewModesCycleOrder.indexOf(currentMainViewMode);
+                currentModeIndex = (currentModeIndex + 1) % mainViewModesCycleOrder.length;
+                currentMainViewMode = mainViewModesCycleOrder[currentModeIndex];
+                renderMainView();
+                const modeChangeMessage = `Main application view mode switched to: ${currentMainViewMode} (via Alt+M)`;
+                if (isTerminalActive) { logAndDisplay(modeChangeMessage); }
+                else { console.log(modeChangeMessage); }
+            }
+            // Esc: Deactivate terminal (if not in editor), or suggest closing editor
+            else if (isTerminalActive && event.key === 'Escape') {
+                event.preventDefault();
+                if (currentMainViewMode === 'edit') {
+                    logAndDisplay("Editor is active. Use the 'Close Editor' button, `viewmode main`, or Alt+M to change view mode.");
+                } else {
+                    deactivateTerminal();
+                }
+            }
+        });
+
+        // --- Initial Application Setup ---
+        loadFSFromLocalStorage(); // Load or initialize file system
+        applyBackgroundColors();  // Sets body background and calls applyLayout. Terminal colors applied on activation.
+        renderMainView();         // Render initial content for the main application view
+        console.log("Application initialized (v2.3). Ctrl+` to activate terminal. Alt+M to cycle main views.");
+
+    </script>
+</body>
+</html>
